@@ -33,6 +33,9 @@ import type {
   CollectionConfig,
   ContextMap,
 } from "./collections.js";
+import type { RemoteEmbeddingProvider } from "./remote-embedding.js";
+import type { RemoteRerankProvider } from "./remote-rerank.js";
+import type { RemoteQueryExpansionProvider } from "./remote-query-expansion.js";
 
 // =============================================================================
 // Configuration
@@ -64,6 +67,41 @@ export const CHUNK_WINDOW_CHARS = CHUNK_WINDOW_TOKENS * 4;  // 800 chars
  */
 function getLlm(store: Store): LlamaCpp {
   return store.llm ?? getDefaultLlamaCpp();
+}
+
+function formatQueryForRemoteEmbedding(query: string): string {
+  return query;
+}
+
+function formatDocForRemoteEmbedding(text: string, title?: string): string {
+  return title ? `${title}\n${text}` : text;
+}
+
+async function embedSearchQueries(
+  store: Store,
+  texts: string[],
+): Promise<(number[] | null)[]> {
+  if (texts.length === 0) return [];
+  if (store.remoteEmbedding) {
+    const results = await store.remoteEmbedding.embedBatch(texts.map(formatQueryForRemoteEmbedding));
+    return results.map((item) => item?.embedding ?? null);
+  }
+
+  const llm = getLlm(store);
+  const results = await llm.embedBatch(texts.map((text) => formatQueryForEmbedding(text)));
+  return results.map((item) => item?.embedding ?? null);
+}
+
+function chunkDocumentByCharsApprox(
+  content: string,
+  maxChars: number = CHUNK_SIZE_CHARS,
+  overlapChars: number = CHUNK_OVERLAP_CHARS,
+): { text: string; pos: number; tokens: number }[] {
+  return chunkDocument(content, maxChars, overlapChars).map((chunk) => ({
+    text: chunk.text,
+    pos: chunk.pos,
+    tokens: Math.max(1, Math.ceil(chunk.text.length / 4)),
+  }));
 }
 
 // =============================================================================
@@ -985,6 +1023,12 @@ export type Store = {
   dbPath: string;
   /** Optional LlamaCpp instance for this store (overrides the global singleton) */
   llm?: LlamaCpp;
+  /** Optional remote embedding provider configured via YAML/SDK config */
+  remoteEmbedding?: RemoteEmbeddingProvider;
+  /** Optional remote reranking provider configured via YAML/SDK config */
+  remoteRerank?: RemoteRerankProvider;
+  /** Optional remote query expansion provider configured via YAML/SDK config */
+  remoteQueryExpansion?: RemoteQueryExpansionProvider;
   close: () => void;
   ensureVecTable: (dimensions: number) => void;
 
@@ -1306,6 +1350,7 @@ export async function generateEmbeddings(
 ): Promise<EmbedResult> {
   const db = store.db;
   const model = options?.model ?? DEFAULT_EMBED_MODEL;
+  const activeModel = store.remoteEmbedding?.modelUri ?? model;
   const now = new Date().toISOString();
   const { maxDocsPerBatch, maxBatchBytes } = resolveEmbedOptions(options);
   const encoder = new TextEncoder();
@@ -1322,20 +1367,20 @@ export async function generateEmbeddings(
   const totalBytes = docsToEmbed.reduce((sum, doc) => sum + Math.max(0, doc.bytes), 0);
   const totalDocs = docsToEmbed.length;
   const startTime = Date.now();
+  const BATCH_SIZE = 32;
+  const batches = buildEmbeddingBatches(docsToEmbed, maxDocsPerBatch, maxBatchBytes);
 
-  // Use store's LlamaCpp or global singleton, wrapped in a session
-  const llm = getLlm(store);
+  let chunksEmbedded = 0;
+  let errors = 0;
+  let bytesProcessed = 0;
+  let totalChunks = 0;
+  let vectorTableInitialized = false;
 
-  // Create a session manager for this llm instance
-  const result = await withLLMSessionForLlm(llm, async (session) => {
-    let chunksEmbedded = 0;
-    let errors = 0;
-    let bytesProcessed = 0;
-    let totalChunks = 0;
-    let vectorTableInitialized = false;
-    const BATCH_SIZE = 32;
-    const batches = buildEmbeddingBatches(docsToEmbed, maxDocsPerBatch, maxBatchBytes);
-
+  const processBatch = async (
+    embedOne: (text: string) => Promise<number[] | null>,
+    embedMany: (texts: string[]) => Promise<(number[] | null)[]>,
+    useRemoteChunking: boolean,
+  ): Promise<void> => {
     for (const batchMeta of batches) {
       const batchDocs = getEmbeddingDocsForBatch(db, batchMeta);
       const batchChunks: ChunkItem[] = [];
@@ -1345,7 +1390,9 @@ export async function generateEmbeddings(
         if (!doc.body.trim()) continue;
 
         const title = extractTitle(doc.body, doc.path);
-        const chunks = await chunkDocumentByTokens(doc.body);
+        const chunks = useRemoteChunking
+          ? chunkDocumentByCharsApprox(doc.body)
+          : await chunkDocumentByTokens(doc.body);
 
         for (let seq = 0; seq < chunks.length; seq++) {
           batchChunks.push({
@@ -1370,12 +1417,14 @@ export async function generateEmbeddings(
 
       if (!vectorTableInitialized) {
         const firstChunk = batchChunks[0]!;
-        const firstText = formatDocForEmbedding(firstChunk.text, firstChunk.title);
-        const firstResult = await session.embed(firstText);
-        if (!firstResult) {
+        const firstText = useRemoteChunking
+          ? formatDocForRemoteEmbedding(firstChunk.text, firstChunk.title)
+          : formatDocForEmbedding(firstChunk.text, firstChunk.title);
+        const firstEmbedding = await embedOne(firstText);
+        if (!firstEmbedding) {
           throw new Error("Failed to get embedding dimensions from first chunk");
         }
-        store.ensureVecTable(firstResult.embedding.length);
+        store.ensureVecTable(firstEmbedding.length);
         vectorTableInitialized = true;
       }
 
@@ -1385,15 +1434,19 @@ export async function generateEmbeddings(
       for (let batchStart = 0; batchStart < batchChunks.length; batchStart += BATCH_SIZE) {
         const batchEnd = Math.min(batchStart + BATCH_SIZE, batchChunks.length);
         const chunkBatch = batchChunks.slice(batchStart, batchEnd);
-        const texts = chunkBatch.map(chunk => formatDocForEmbedding(chunk.text, chunk.title));
+        const texts = chunkBatch.map((chunk) =>
+          useRemoteChunking
+            ? formatDocForRemoteEmbedding(chunk.text, chunk.title)
+            : formatDocForEmbedding(chunk.text, chunk.title),
+        );
 
         try {
-          const embeddings = await session.embedBatch(texts);
+          const embeddings = await embedMany(texts);
           for (let i = 0; i < chunkBatch.length; i++) {
             const chunk = chunkBatch[i]!;
             const embedding = embeddings[i];
             if (embedding) {
-              insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(embedding.embedding), model, now);
+              insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(embedding), activeModel, now);
               chunksEmbedded++;
             } else {
               errors++;
@@ -1401,13 +1454,11 @@ export async function generateEmbeddings(
             batchChunkBytesProcessed += chunk.bytes;
           }
         } catch {
-          // Batch failed — try individual embeddings as fallback
-          for (const chunk of chunkBatch) {
+          for (const [index, chunk] of chunkBatch.entries()) {
             try {
-              const text = formatDocForEmbedding(chunk.text, chunk.title);
-              const result = await session.embed(text);
-              if (result) {
-                insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(result.embedding), model, now);
+              const embedding = await embedOne(texts[index]!);
+              if (embedding) {
+                insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(embedding), activeModel, now);
                 chunksEmbedded++;
               } else {
                 errors++;
@@ -1434,14 +1485,32 @@ export async function generateEmbeddings(
       bytesProcessed += batchBytes;
       options?.onProgress?.({ chunksEmbedded, totalChunks, bytesProcessed, totalBytes, errors });
     }
+  };
 
-    return { chunksEmbedded, errors };
-  }, { maxDuration: 30 * 60 * 1000, name: 'generateEmbeddings' });
+  if (store.remoteEmbedding) {
+    await processBatch(
+      async (text) => (await store.remoteEmbedding!.embed(text))?.embedding ?? null,
+      async (texts) => (await store.remoteEmbedding!.embedBatch(texts)).map((item) => item?.embedding ?? null),
+      true,
+    );
+  } else {
+    const llm = getLlm(store);
+    const result = await withLLMSessionForLlm(llm, async (session) => {
+      await processBatch(
+        async (text) => (await session.embed(text))?.embedding ?? null,
+        async (texts) => (await session.embedBatch(texts)).map((item) => item?.embedding ?? null),
+        false,
+      );
+      return { chunksEmbedded, errors };
+    }, { maxDuration: 30 * 60 * 1000, name: "generateEmbeddings" });
+    chunksEmbedded = result.chunksEmbedded;
+    errors = result.errors;
+  }
 
   return {
     docsProcessed: totalDocs,
-    chunksEmbedded: result.chunksEmbedded,
-    errors: result.errors,
+    chunksEmbedded,
+    errors,
     durationMs: Date.now() - startTime,
   };
 }
@@ -1498,11 +1567,14 @@ export function createStore(dbPath?: string): Store {
 
     // Search
     searchFTS: (query: string, limit?: number, collectionName?: string) => searchFTS(db, query, limit, collectionName),
-    searchVec: (query: string, model: string, limit?: number, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[]) => searchVec(db, query, model, limit, collectionName, session, precomputedEmbedding),
+    searchVec: (query: string, model: string, limit?: number, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[]) =>
+      searchVec(db, query, model, limit, collectionName, session, precomputedEmbedding, store.remoteEmbedding),
 
     // Query expansion & reranking
-    expandQuery: (query: string, model?: string, intent?: string) => expandQuery(query, model, db, intent, store.llm),
-    rerank: (query: string, documents: { file: string; text: string }[], model?: string, intent?: string) => rerank(query, documents, model, db, intent, store.llm),
+    expandQuery: (query: string, model?: string, intent?: string) =>
+      expandQuery(query, model, db, intent, store.llm, store.remoteQueryExpansion),
+    rerank: (query: string, documents: { file: string; text: string }[], model?: string, intent?: string) =>
+      rerank(query, documents, model, db, intent, store.llm, store.remoteRerank),
 
     // Document retrieval
     findDocument: (filename: string, options?: { includeBody?: boolean }) => findDocument(db, filename, options),
@@ -2817,11 +2889,20 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
 // Vector Search
 // =============================================================================
 
-export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[]): Promise<SearchResult[]> {
+export async function searchVec(
+  db: Database,
+  query: string,
+  model: string,
+  limit: number = 20,
+  collectionName?: string,
+  session?: ILLMSession,
+  precomputedEmbedding?: number[],
+  remoteEmbedding?: RemoteEmbeddingProvider,
+): Promise<SearchResult[]> {
   const tableExists = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
   if (!tableExists) return [];
 
-  const embedding = precomputedEmbedding ?? await getEmbedding(query, model, true, session);
+  const embedding = precomputedEmbedding ?? await getEmbedding(query, model, true, session, undefined, remoteEmbedding);
   if (!embedding) return [];
 
   // IMPORTANT: We use a two-step query approach here because sqlite-vec virtual tables
@@ -2907,8 +2988,20 @@ export async function searchVec(db: Database, query: string, model: string, limi
 // Embeddings
 // =============================================================================
 
-async function getEmbedding(text: string, model: string, isQuery: boolean, session?: ILLMSession, llmOverride?: LlamaCpp): Promise<number[] | null> {
-  // Format text using the appropriate prompt template
+async function getEmbedding(
+  text: string,
+  model: string,
+  isQuery: boolean,
+  session?: ILLMSession,
+  llmOverride?: LlamaCpp,
+  remoteEmbedding?: RemoteEmbeddingProvider,
+): Promise<number[] | null> {
+  if (remoteEmbedding) {
+    const formattedText = isQuery ? formatQueryForRemoteEmbedding(text) : formatDocForRemoteEmbedding(text);
+    const result = await remoteEmbedding.embed(formattedText);
+    return result?.embedding || null;
+  }
+
   const formattedText = isQuery ? formatQueryForEmbedding(text, model) : formatDocForEmbedding(text, undefined, model);
   const result = session
     ? await session.embed(formattedText, { model, isQuery })
@@ -2965,9 +3058,17 @@ export function insertEmbedding(
 // Query expansion
 // =============================================================================
 
-export async function expandQuery(query: string, model: string = DEFAULT_QUERY_MODEL, db: Database, intent?: string, llmOverride?: LlamaCpp): Promise<ExpandedQuery[]> {
+export async function expandQuery(
+  query: string,
+  model: string = DEFAULT_QUERY_MODEL,
+  db: Database,
+  intent?: string,
+  llmOverride?: LlamaCpp,
+  remoteQueryExpansion?: RemoteQueryExpansionProvider,
+): Promise<ExpandedQuery[]> {
   // Check cache first — stored as JSON preserving types
-  const cacheKey = getCacheKey("expandQuery", { query, model, ...(intent && { intent }) });
+  const providerModel = remoteQueryExpansion?.modelUri;
+  const cacheKey = getCacheKey("expandQuery", { query, model, ...(intent && { intent }), ...(providerModel && { providerModel }) });
   const cached = getCachedResult(db, cacheKey);
   if (cached) {
     try {
@@ -2983,9 +3084,9 @@ export async function expandQuery(query: string, model: string = DEFAULT_QUERY_M
     }
   }
 
-  const llm = llmOverride ?? getDefaultLlamaCpp();
-  // Note: LlamaCpp uses hardcoded model, model parameter is ignored
-  const results = await llm.expandQuery(query, { intent });
+  const results = remoteQueryExpansion
+    ? await remoteQueryExpansion.expandQuery(query, { intent })
+    : await (llmOverride ?? getDefaultLlamaCpp()).expandQuery(query, { intent });
 
   // Map Queryable[] → ExpandedQuery[] (same shape, decoupled from llm.ts internals).
   // Filter out entries that duplicate the original query text.
@@ -3004,9 +3105,19 @@ export async function expandQuery(query: string, model: string = DEFAULT_QUERY_M
 // Reranking
 // =============================================================================
 
-export async function rerank(query: string, documents: { file: string; text: string }[], model: string = DEFAULT_RERANK_MODEL, db: Database, intent?: string, llmOverride?: LlamaCpp): Promise<{ file: string; score: number }[]> {
+export async function rerank(
+  query: string,
+  documents: { file: string; text: string }[],
+  model: string = DEFAULT_RERANK_MODEL,
+  db: Database,
+  intent?: string,
+  llmOverride?: LlamaCpp,
+  remoteRerank?: RemoteRerankProvider,
+): Promise<{ file: string; score: number }[]> {
   // Prepend intent to rerank query so the reranker scores with domain context
   const rerankQuery = intent ? `${intent}\n\n${query}` : query;
+  const providerModel = remoteRerank?.modelUri;
+  const providerEndpoint = remoteRerank?.endpoint;
 
   const cachedResults: Map<string, number> = new Map();
   const uncachedDocsByChunk: Map<string, RerankDocument> = new Map();
@@ -3017,8 +3128,8 @@ export async function rerank(query: string, documents: { file: string; text: str
   // File path is excluded from the new cache key because the reranker score
   // depends on the chunk content, not where it came from.
   for (const doc of documents) {
-    const cacheKey = getCacheKey("rerank", { query: rerankQuery, model, chunk: doc.text });
-    const legacyCacheKey = getCacheKey("rerank", { query, file: doc.file, model, chunk: doc.text });
+    const cacheKey = getCacheKey("rerank", { query: rerankQuery, model, chunk: doc.text, ...(providerModel && { providerModel }), ...(providerEndpoint && { providerEndpoint }) });
+    const legacyCacheKey = getCacheKey("rerank", { query, file: doc.file, model, chunk: doc.text, ...(providerModel && { providerModel }), ...(providerEndpoint && { providerEndpoint }) });
     const cached = getCachedResult(db, cacheKey) ?? getCachedResult(db, legacyCacheKey);
     if (cached !== null) {
       cachedResults.set(doc.text, parseFloat(cached));
@@ -3029,15 +3140,16 @@ export async function rerank(query: string, documents: { file: string; text: str
 
   // Rerank uncached documents using LlamaCpp
   if (uncachedDocsByChunk.size > 0) {
-    const llm = llmOverride ?? getDefaultLlamaCpp();
     const uncachedDocs = [...uncachedDocsByChunk.values()];
-    const rerankResult = await llm.rerank(rerankQuery, uncachedDocs, { model });
+    const rerankResult = remoteRerank
+      ? await remoteRerank.rerank(rerankQuery, uncachedDocs)
+      : await (llmOverride ?? getDefaultLlamaCpp()).rerank(rerankQuery, uncachedDocs, { model });
 
     // Cache results by chunk text so identical chunks across files are scored once.
     const textByFile = new Map(uncachedDocs.map(d => [d.file, d.text]));
     for (const result of rerankResult.results) {
       const chunk = textByFile.get(result.file) || "";
-      const cacheKey = getCacheKey("rerank", { query: rerankQuery, model, chunk });
+      const cacheKey = getCacheKey("rerank", { query: rerankQuery, model, chunk, ...(providerModel && { providerModel }), ...(providerEndpoint && { providerEndpoint }) });
       setCachedResult(db, cacheKey, result.score.toString());
       cachedResults.set(chunk, result.score);
     }
@@ -3796,16 +3908,15 @@ export async function hybridQuery(
     }
 
     // Batch embed all vector queries in a single call
-    const llm = getLlm(store);
-    const textsToEmbed = vecQueries.map(q => formatQueryForEmbedding(q.text));
+    const textsToEmbed = vecQueries.map((q) => q.text);
     hooks?.onEmbedStart?.(textsToEmbed.length);
     const embedStart = Date.now();
-    const embeddings = await llm.embedBatch(textsToEmbed);
+    const embeddings = await embedSearchQueries(store, textsToEmbed);
     hooks?.onEmbedDone?.(Date.now() - embedStart);
 
     // Run sqlite-vec lookups with pre-computed embeddings
     for (let i = 0; i < vecQueries.length; i++) {
-      const embedding = embeddings[i]?.embedding;
+      const embedding = embeddings[i];
       if (!embedding) continue;
 
       const vecResults = await store.searchVec(
@@ -4177,15 +4288,14 @@ export async function structuredSearch(
         s.type === 'vec' || s.type === 'hyde'
     );
     if (vecSearches.length > 0) {
-      const llm = getLlm(store);
-      const textsToEmbed = vecSearches.map(s => formatQueryForEmbedding(s.query));
+      const textsToEmbed = vecSearches.map((s) => s.query);
       hooks?.onEmbedStart?.(textsToEmbed.length);
       const embedStart = Date.now();
-      const embeddings = await llm.embedBatch(textsToEmbed);
+      const embeddings = await embedSearchQueries(store, textsToEmbed);
       hooks?.onEmbedDone?.(Date.now() - embedStart);
 
       for (let i = 0; i < vecSearches.length; i++) {
-        const embedding = embeddings[i]?.embedding;
+        const embedding = embeddings[i];
         if (!embedding) continue;
 
         for (const coll of collectionList) {

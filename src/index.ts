@@ -79,7 +79,13 @@ import {
   type CollectionConfig,
   type NamedCollection,
   type ContextMap,
+  type RemoteEmbeddingConfig,
+  type RemoteRerankConfig,
+  type RemoteQueryExpansionConfig,
 } from "./collections.js";
+import { createRemoteEmbeddingProvider } from "./remote-embedding.js";
+import { createRemoteRerankProvider } from "./remote-rerank.js";
+import { createRemoteQueryExpansionProvider } from "./remote-query-expansion.js";
 
 // Re-export types for SDK consumers
 export type {
@@ -103,6 +109,9 @@ export type {
   CollectionConfig,
   NamedCollection,
   ContextMap,
+  RemoteEmbeddingConfig,
+  RemoteRerankConfig,
+  RemoteQueryExpansionConfig,
 };
 
 // Re-export the internal Store type for advanced consumers
@@ -345,16 +354,19 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
   // Track whether we have a YAML config path for write-through
   const hasYamlConfig = !!options.configPath;
 
+  let resolvedConfig: CollectionConfig | undefined;
+
   // Sync config into SQLite store_collections
   if (options.configPath) {
     // YAML mode: inject config source for write-through, sync to DB
     setConfigSource({ configPath: options.configPath });
-    const config = loadConfig();
-    syncConfigToDb(db, config);
+    resolvedConfig = loadConfig();
+    syncConfigToDb(db, resolvedConfig);
   } else if (options.config) {
     // Inline config mode: inject config source for mutations, sync to DB
     setConfigSource({ config: options.config });
     syncConfigToDb(db, options.config);
+    resolvedConfig = options.config;
   }
   // else: DB-only mode — no external config, use existing store_collections
 
@@ -365,6 +377,11 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
     disposeModelsOnInactivity: true,
   });
   internal.llm = llm;
+  if (resolvedConfig) {
+    internal.remoteEmbedding = createRemoteEmbeddingProvider(resolvedConfig.embedding);
+    internal.remoteRerank = createRemoteRerankProvider(resolvedConfig.rerank);
+    internal.remoteQueryExpansion = createRemoteQueryExpansionProvider(resolvedConfig.query_expansion);
+  }
 
   const store: QMDStore = {
     internal,

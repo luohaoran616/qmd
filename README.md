@@ -514,6 +514,77 @@ Supported model families:
 > since vectors are not cross-compatible between models. The prompt format is
 > automatically adjusted for each model family.
 
+### Remote Providers (Optional)
+
+QMD can also use remote inference providers for embeddings, reranking, and
+query expansion. This is useful on low-memory servers where keeping the local
+GGUF stack loaded is impractical.
+
+If you want a ready-to-copy config, start from `example-index.remote.yml` and
+rename it to `~/.config/qmd/index.yml`.
+
+Configure `~/.config/qmd/index.yml`:
+
+```yaml
+collections:
+  docs:
+    path: /path/to/docs
+    pattern: "**/*.md"
+
+embedding:
+  provider: openai-compatible
+  model: text-embedding-3-small
+  api_key: ${OPENAI_API_KEY}
+  base_url: https://api.openai.com/v1
+  dimensions: 1536
+
+rerank:
+  provider: openai-compatible
+  model: gpt-4o-mini
+  api_key: ${OPENAI_API_KEY}
+  base_url: https://api.openai.com/v1
+  # Optional: use a native rerank endpoint when supported
+  # endpoint: rerank
+
+query_expansion:
+  provider: openai-compatible
+  model: gpt-4o-mini
+  api_key: ${OPENAI_API_KEY}
+  base_url: https://api.openai.com/v1
+```
+
+Notes:
+- Remote providers are opt-in. Without these config sections, QMD behaves exactly
+  like upstream and uses local GGUF models.
+- `openai-compatible` works with OpenAI and many API-compatible gateways such as
+  OpenRouter, vLLM, Ollama, and LM Studio by changing `base_url`.
+- `api_key` supports `${ENV_VAR}` syntax and falls back to `OPENAI_API_KEY`.
+- `rerank` defaults to a `/chat/completions`-based JSON reranker for maximum
+  compatibility across OpenAI-style providers.
+- If your provider exposes a native `/rerank` endpoint, set
+  `rerank.endpoint: rerank` and use a native reranker model such as
+  `Qwen/Qwen3-Reranker-0.6B`.
+- If you stay on the default chat-completions rerank path, prefer strong
+  instruct/chat models with stable structured output such as `gpt-4o-mini` or
+  `THUDM/GLM-4-9B-0414`.
+- `qmd status` shows whether each capability is using a local or remote model.
+
+### Low-Memory Deployment
+
+If your OpenClaw or MCP deployment runs on a cloud VM with less than 2 GB of
+available RAM and no GPU, the default local stack is usually a bad fit:
+
+- `embeddinggemma-300M` is relatively small, but still adds model load time and RAM pressure.
+- `qwen3-reranker-0.6b` is heavier and can dominate CPU-only latency.
+- `qmd-query-expansion-1.7B` is a fine-tuned `Qwen3-1.7B` model and is the least
+  suitable of the three for tiny CPU-only machines.
+
+Recommended setup for those machines:
+
+- Keep indexing and SQLite locally.
+- Move `embedding`, `rerank`, and `query_expansion` to remote providers.
+- Leave local models as the fallback path for laptops or larger hosts.
+
 ## Installation
 
 ```sh

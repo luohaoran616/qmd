@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Changes
+
+- **Remote inference providers**: add config-driven `openai-compatible`
+  providers for embeddings, reranking, and query expansion. Configure them in
+  `~/.config/qmd/index.yml` under `embedding`, `rerank`, and
+  `query_expansion`. Local GGUF models remain the default when no remote
+  provider is configured.
+
 ### Fixes
 
 - Sync stale `bun.lock` (`better-sqlite3` 11.x → 12.x). CI and release

@@ -34,11 +34,53 @@ export interface Collection {
 }
 
 /**
+ * Remote inference provider names supported by config-driven integrations.
+ */
+export type RemoteProviderName = "openai-compatible";
+
+/**
+ * Shared remote provider configuration shape.
+ */
+export interface RemoteProviderConfig {
+  provider: RemoteProviderName;
+  model: string;
+  api_key?: string;
+  base_url?: string;
+  timeout_ms?: number;
+}
+
+/**
+ * Embedding-specific remote configuration.
+ */
+export interface RemoteEmbeddingConfig extends RemoteProviderConfig {
+  dimensions?: number;
+}
+
+/**
+ * Reranking-specific remote configuration.
+ */
+export interface RemoteRerankConfig extends RemoteProviderConfig {
+  endpoint?: "chat-completions" | "rerank";
+  max_documents?: number;
+}
+
+/**
+ * Query expansion-specific remote configuration.
+ */
+export interface RemoteQueryExpansionConfig extends RemoteProviderConfig {
+  temperature?: number;
+  max_tokens?: number;
+}
+
+/**
  * The complete configuration file structure
  */
 export interface CollectionConfig {
   global_context?: string;                    // Context applied to all collections
   collections: Record<string, Collection>;    // Collection name -> config
+  embedding?: RemoteEmbeddingConfig;          // Optional remote embedding provider
+  rerank?: RemoteRerankConfig;                // Optional remote reranker
+  query_expansion?: RemoteQueryExpansionConfig; // Optional remote query expansion
 }
 
 /**

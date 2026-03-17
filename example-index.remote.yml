@@ -1,0 +1,109 @@
+# QMD remote-provider example configuration
+# Copy to: ~/.config/qmd/index.yml
+#
+# This example is designed for low-memory cloud deployments:
+# - embeddings: remote
+# - reranking: remote
+# - query expansion: remote
+#
+# By default this sample targets the OpenAI API.
+# To use another OpenAI-compatible backend, change only `base_url`
+# and `model` values below.
+#
+# Examples:
+# - OpenAI:     https://api.openai.com/v1
+# - OpenRouter: https://openrouter.ai/api/v1
+# - Ollama:     http://127.0.0.1:11434/v1
+# - vLLM:       http://127.0.0.1:8000/v1
+# - LM Studio:  http://127.0.0.1:1234/v1
+#
+# Recommended remote substitutions for QMD's default local models:
+# - embeddinggemma-300M            -> text-embedding-3-small
+# - qwen3-reranker-0.6b-q8_0       -> gpt-4o-mini
+# - qmd-query-expansion-1.7B       -> gpt-4o-mini
+#
+# If you want higher-quality embeddings and cost is less important:
+# - text-embedding-3-small         -> text-embedding-3-large
+#
+# If you self-host an OpenAI-compatible endpoint:
+# - embeddings can often use: Qwen/Qwen3-Embedding-0.6B, Qwen/Qwen3-Embedding-4B, BAAI/bge-m3
+# - rerank / query expansion can often use: Qwen/Qwen3-4B-Instruct, Qwen/Qwen3-8B-Instruct
+#
+# Notes:
+# - `embedding` requires an embeddings-compatible endpoint.
+# - `query_expansion` uses `/chat/completions`.
+# - `rerank` defaults to `/chat/completions`, but can opt into native `/rerank`
+#   with `endpoint: rerank` for providers that expose it.
+# - For chat-completions rerank/query expansion, prefer models with good
+#   instruction following and stable structured output.
+
+global_context: "Engineering docs, notes, and memory files for retrieval."
+
+collections:
+  memory-root:
+    path: ~/.openclaw/workspace
+    pattern: "MEMORY.md"
+    context:
+      "/": "Primary memory file for OpenClaw."
+
+  memory-alt:
+    path: ~/.openclaw/workspace
+    pattern: "memory.md"
+    context:
+      "/": "Alternate root memory file for OpenClaw."
+
+  memory-dir:
+    path: ~/.openclaw/workspace/memory
+    pattern: "**/*.md"
+    context:
+      "/": "Structured markdown memory files."
+
+embedding:
+  provider: openai-compatible
+  model: Qwen/Qwen3-Embedding-0.6B
+  api_key: ${SILICONFLOW_API_KEY}
+  base_url: https://api.siliconflow.cn/v1
+  timeout_ms: 30000
+  dimensions: 1024
+  # Good alternatives:
+  # model: text-embedding-3-large
+  # model: Qwen/Qwen3-Embedding-0.6B
+  # model: Qwen/Qwen3-Embedding-4B
+  # model: BAAI/bge-m3
+
+# rerank:
+#   provider: openai-compatible
+#   model: THUDM/GLM-4-9B-0414
+#   api_key: ${SILICONFLOW_API_KEY}
+#   base_url: https://api.siliconflow.cn/v1
+#   timeout_ms: 30000
+#   max_documents: 40
+rerank:
+  provider: openai-compatible
+  endpoint: rerank
+  model: Qwen/Qwen3-Reranker-0.6B
+  api_key: ${SILICONFLOW_API_KEY}
+  base_url: https://api.siliconflow.cn/v1
+  timeout_ms: 30000
+  max_documents: 40
+  # Default mode is chat-completions.
+  # For providers with a native rerank API, opt in explicitly:
+  # endpoint: rerank
+  # model: Qwen/Qwen3-Reranker-0.6B
+  # Safer chat-completions alternatives:
+  # model: gpt-4.1-mini
+  # model: Qwen/Qwen3-8B-Instruct
+
+query_expansion:
+  provider: openai-compatible
+  model: Qwen/Qwen2.5-7B-Instruct
+  api_key: ${SILICONFLOW_API_KEY}
+  base_url: https://api.siliconflow.cn/v1
+  timeout_ms: 30000
+  temperature: 0.2
+  max_tokens: 400
+  # Safer quality upgrade:
+  # model: gpt-4.1-mini
+  # Self-hosted alternatives:
+  # model: Qwen/Qwen3-4B-Instruct
+  # model: Qwen/Qwen3-8B-Instruct

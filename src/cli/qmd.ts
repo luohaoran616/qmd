@@ -98,6 +98,9 @@ import {
   loadConfig,
 } from "../collections.js";
 import { getEmbeddedQmdSkillContent, getEmbeddedQmdSkillFiles } from "../embedded-skills.js";
+import { createRemoteEmbeddingProvider } from "../remote-embedding.js";
+import { createRemoteRerankProvider } from "../remote-rerank.js";
+import { createRemoteQueryExpansionProvider } from "../remote-query-expansion.js";
 
 // Enable production mode - allows using default database path
 // Tests must set INDEX_PATH or use createStore() with explicit path
@@ -117,6 +120,9 @@ function getStore(): ReturnType<typeof createStore> {
     try {
       const config = loadConfig();
       syncConfigToDb(store.db, config);
+      store.remoteEmbedding = createRemoteEmbeddingProvider(config.embedding);
+      store.remoteRerank = createRemoteRerankProvider(config.rerank);
+      store.remoteQueryExpansion = createRemoteQueryExpansionProvider(config.query_expansion);
     } catch {
       // Config may not exist yet — that's fine, DB works without it
     }
@@ -136,6 +142,9 @@ function resyncConfig(): void {
     // Clear config hash to force re-sync
     s.db.prepare(`DELETE FROM store_config WHERE key = 'config_hash'`).run();
     syncConfigToDb(s.db, config);
+    s.remoteEmbedding = createRemoteEmbeddingProvider(config.embedding);
+    s.remoteRerank = createRemoteRerankProvider(config.rerank);
+    s.remoteQueryExpansion = createRemoteQueryExpansionProvider(config.query_expansion);
   } catch {
     // Config may not exist — that's fine
   }
@@ -420,40 +429,56 @@ async function showStatus(): Promise<void> {
       const match = uri.match(/^hf:([^/]+\/[^/]+)\//);
       return match ? `https://huggingface.co/${match[1]}` : uri;
     };
+    const storeInstance = getStore();
+    const embeddingDisplay = storeInstance.remoteEmbedding
+      ? `${c.green}${storeInstance.remoteEmbedding.provider}${c.reset} ${storeInstance.remoteEmbedding.model}${storeInstance.remoteEmbedding.dimensions ? ` (${storeInstance.remoteEmbedding.dimensions}d)` : ""} ${c.dim}(remote)${c.reset}`
+      : hfLink(DEFAULT_EMBED_MODEL_URI);
+    const rerankingDisplay = storeInstance.remoteRerank
+      ? `${c.green}${storeInstance.remoteRerank.provider}${c.reset} ${storeInstance.remoteRerank.model} ${c.dim}(${storeInstance.remoteRerank.endpoint}, remote)${c.reset}`
+      : hfLink(DEFAULT_RERANK_MODEL_URI);
+    const generationDisplay = storeInstance.remoteQueryExpansion
+      ? `${c.green}${storeInstance.remoteQueryExpansion.provider}${c.reset} ${storeInstance.remoteQueryExpansion.model} ${c.dim}(remote)${c.reset}`
+      : hfLink(DEFAULT_GENERATE_MODEL_URI);
     console.log(`\n${c.bold}Models${c.reset}`);
-    console.log(`  Embedding:   ${hfLink(DEFAULT_EMBED_MODEL_URI)}`);
-    console.log(`  Reranking:   ${hfLink(DEFAULT_RERANK_MODEL_URI)}`);
-    console.log(`  Generation:  ${hfLink(DEFAULT_GENERATE_MODEL_URI)}`);
+    console.log(`  Embedding:   ${embeddingDisplay}`);
+    console.log(`  Reranking:   ${rerankingDisplay}`);
+    console.log(`  Generation:  ${generationDisplay}`);
   }
 
   // Device / GPU info
-  try {
-    const llm = getDefaultLlamaCpp();
-    const device = await llm.getDeviceInfo();
-    console.log(`\n${c.bold}Device${c.reset}`);
-    if (device.gpu) {
-      console.log(`  GPU:      ${c.green}${device.gpu}${c.reset} (offloading: ${device.gpuOffloading ? 'yes' : 'no'})`);
-      if (device.gpuDevices.length > 0) {
-        // Deduplicate and count GPUs
-        const counts = new Map<string, number>();
-        for (const name of device.gpuDevices) {
-          counts.set(name, (counts.get(name) || 0) + 1);
+  const storeInstance = getStore();
+  if (!storeInstance.remoteEmbedding || !storeInstance.remoteRerank || !storeInstance.remoteQueryExpansion) {
+    try {
+      const llm = getDefaultLlamaCpp();
+      const device = await llm.getDeviceInfo();
+      console.log(`\n${c.bold}Device${c.reset}`);
+      if (device.gpu) {
+        console.log(`  GPU:      ${c.green}${device.gpu}${c.reset} (offloading: ${device.gpuOffloading ? 'yes' : 'no'})`);
+        if (device.gpuDevices.length > 0) {
+          // Deduplicate and count GPUs
+          const counts = new Map<string, number>();
+          for (const name of device.gpuDevices) {
+            counts.set(name, (counts.get(name) || 0) + 1);
+          }
+          const deviceStr = Array.from(counts.entries())
+            .map(([name, count]) => count > 1 ? `${count}× ${name}` : name)
+            .join(', ');
+          console.log(`  Devices:  ${deviceStr}`);
         }
-        const deviceStr = Array.from(counts.entries())
-          .map(([name, count]) => count > 1 ? `${count}× ${name}` : name)
-          .join(', ');
-        console.log(`  Devices:  ${deviceStr}`);
+        if (device.vram) {
+          console.log(`  VRAM:     ${formatBytes(device.vram.free)} free / ${formatBytes(device.vram.total)} total`);
+        }
+      } else {
+        console.log(`  GPU:      ${c.yellow}none${c.reset} (running on CPU — models will be slow)`);
+        console.log(`  ${c.dim}Tip: Install CUDA, Vulkan, or Metal support for GPU acceleration.${c.reset}`);
       }
-      if (device.vram) {
-        console.log(`  VRAM:     ${formatBytes(device.vram.free)} free / ${formatBytes(device.vram.total)} total`);
-      }
-    } else {
-      console.log(`  GPU:      ${c.yellow}none${c.reset} (running on CPU — models will be slow)`);
-      console.log(`  ${c.dim}Tip: Install CUDA, Vulkan, or Metal support for GPU acceleration.${c.reset}`);
+      console.log(`  CPU:      ${device.cpuCores} math cores`);
+    } catch {
+      // Don't fail status if LLM init fails
     }
-    console.log(`  CPU:      ${device.cpuCores} math cores`);
-  } catch {
-    // Don't fail status if LLM init fails
+  } else {
+    console.log(`\n${c.bold}Device${c.reset}`);
+    console.log(`  Local models inactive: ${c.dim}all inference capabilities use remote providers${c.reset}`);
   }
 
   // Tips section
@@ -1637,7 +1662,10 @@ async function vectorIndex(
     return;
   }
 
-  console.log(`${c.dim}Model: ${model}${c.reset}\n`);
+  const displayModel = storeInstance.remoteEmbedding
+    ? `${storeInstance.remoteEmbedding.modelUri} (remote)`
+    : model;
+  console.log(`${c.dim}Model: ${displayModel}${c.reset}\n`);
   if (batchOptions?.maxDocsPerBatch !== undefined || batchOptions?.maxBatchBytes !== undefined) {
     const maxDocsPerBatch = batchOptions.maxDocsPerBatch ?? DEFAULT_EMBED_MAX_DOCS_PER_BATCH;
     const maxBatchBytes = batchOptions.maxBatchBytes ?? DEFAULT_EMBED_MAX_BATCH_BYTES;
