@@ -19,3 +19,5 @@ texts/
 finetune/outputs/
 finetune/data/train/
 .claude/
+else/openclaw.json
+else/openclaw-qmd-xdg/cache/

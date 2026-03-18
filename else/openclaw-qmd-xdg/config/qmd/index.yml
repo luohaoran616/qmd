@@ -1,0 +1,48 @@
+# OpenClaw-dedicated QMD config for memory backend.
+# This file is consumed via qmd-openclaw.cmd (XDG_CONFIG_HOME override).
+global_context: "OpenClaw memory retrieval index"
+
+collections:
+  memory-root:
+    path: C:/Users/lhr/.openclaw/workspace
+    pattern: "MEMORY.md"
+    context:
+      "/": "Primary memory file for OpenClaw."
+
+  memory-alt:
+    path: C:/Users/lhr/.openclaw/workspace
+    pattern: "memory.md"
+    context:
+      "/": "Fallback root memory file for OpenClaw."
+
+  memory-dir:
+    path: C:/Users/lhr/.openclaw/workspace/memory
+    pattern: "**/*.md"
+    context:
+      "/": "Daily and structured memory markdown files."
+
+embedding:
+  provider: openai-compatible
+  model: Qwen/Qwen3-Embedding-0.6B
+  api_key: ${SILICONFLOW_API_KEY}
+  base_url: https://api.siliconflow.cn/v1
+  timeout_ms: 30000
+  dimensions: 1024
+
+rerank:
+  provider: openai-compatible
+  endpoint: rerank
+  model: Qwen/Qwen3-Reranker-0.6B
+  api_key: ${SILICONFLOW_API_KEY}
+  base_url: https://api.siliconflow.cn/v1
+  timeout_ms: 30000
+  max_documents: 40
+
+query_expansion:
+  provider: openai-compatible
+  model: Qwen/Qwen2.5-7B-Instruct
+  api_key: ${SILICONFLOW_API_KEY}
+  base_url: https://api.siliconflow.cn/v1
+  timeout_ms: 30000
+  temperature: 0.2
+  max_tokens: 400
