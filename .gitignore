@@ -16,6 +16,7 @@ texts/
 !skills/**/*.md
 !finetune/*.md
 !docs/*.md
+!else/openclaw-hooks/**/*.md
 finetune/outputs/
 finetune/data/train/
 .claude/
