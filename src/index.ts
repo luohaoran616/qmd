@@ -370,17 +370,22 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
   }
   // else: DB-only mode — no external config, use existing store_collections
 
-  // Create a per-store LlamaCpp instance — lazy-loads models on first use,
-  // auto-unloads after 5 min inactivity to free VRAM.
-  const llm = new LlamaCpp({
-    inactivityTimeoutMs: 5 * 60 * 1000,
-    disposeModelsOnInactivity: true,
-  });
-  internal.llm = llm;
   if (resolvedConfig) {
     internal.remoteEmbedding = createRemoteEmbeddingProvider(resolvedConfig.embedding);
     internal.remoteRerank = createRemoteRerankProvider(resolvedConfig.rerank);
     internal.remoteQueryExpansion = createRemoteQueryExpansionProvider(resolvedConfig.query_expansion);
+  }
+  const needsLocalLlm = !internal.remoteEmbedding || !internal.remoteRerank || !internal.remoteQueryExpansion;
+
+  // In remote-only mode, avoid instantiating a local LlamaCpp at all.
+  const llm = needsLocalLlm
+    ? new LlamaCpp({
+      inactivityTimeoutMs: 5 * 60 * 1000,
+      disposeModelsOnInactivity: true,
+    })
+    : null;
+  if (llm) {
+    internal.llm = llm;
   }
 
   const store: QMDStore = {
@@ -533,7 +538,9 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
 
     // Lifecycle
     close: async () => {
-      await llm.dispose();
+      if (llm) {
+        await llm.dispose();
+      }
       internal.close();
       if (hasYamlConfig || options.config) {
         setConfigSource(undefined); // Reset config source

@@ -200,6 +200,7 @@ describe("createStore remote wiring", () => {
     expect(store.internal.remoteRerank?.model).toBe("gpt-4o-mini");
     expect(store.internal.remoteRerank?.endpoint).toBe("rerank");
     expect(store.internal.remoteQueryExpansion?.model).toBe("gpt-4o-mini");
+    expect(store.internal.llm).toBeUndefined();
     await store.close();
   });
 });

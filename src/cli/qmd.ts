@@ -76,7 +76,7 @@ import {
   syncConfigToDb,
   type ReindexResult,
 } from "../store.js";
-import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR } from "../llm.js";
+import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR } from "../llm.js";
 import {
   formatSearchResults,
   formatDocuments,
@@ -2175,45 +2175,43 @@ async function vectorSearch(query: string, opts: OutputOptions, _model: string =
 
   checkIndexHealth(store.db);
 
-  await withLLMSession(async () => {
-    let results = await vectorSearchQuery(store, query, {
-      collection: singleCollection,
-      limit: opts.all ? 500 : (opts.limit || 10),
-      minScore: opts.minScore || 0.3,
-      intent: opts.intent,
-      hooks: {
-        onExpand: (original, expanded) => {
-          logExpansionTree(original, expanded);
-          process.stderr.write(`${c.dim}Searching ${expanded.length + 1} vector queries...${c.reset}\n`);
-        },
+  let results = await vectorSearchQuery(store, query, {
+    collection: singleCollection,
+    limit: opts.all ? 500 : (opts.limit || 10),
+    minScore: opts.minScore || 0.3,
+    intent: opts.intent,
+    hooks: {
+      onExpand: (original, expanded) => {
+        logExpansionTree(original, expanded);
+        process.stderr.write(`${c.dim}Searching ${expanded.length + 1} vector queries...${c.reset}\n`);
       },
+    },
+  });
+
+  // Post-filter for multi-collection
+  if (collectionNames.length > 1) {
+    results = results.filter(r => {
+      const prefixes = collectionNames.map(n => `qmd://${n}/`);
+      return prefixes.some(p => r.file.startsWith(p));
     });
+  }
 
-    // Post-filter for multi-collection
-    if (collectionNames.length > 1) {
-      results = results.filter(r => {
-        const prefixes = collectionNames.map(n => `qmd://${n}/`);
-        return prefixes.some(p => r.file.startsWith(p));
-      });
-    }
+  closeDb();
 
-    closeDb();
+  if (results.length === 0) {
+    printEmptySearchResults(opts.format);
+    return;
+  }
 
-    if (results.length === 0) {
-      printEmptySearchResults(opts.format);
-      return;
-    }
-
-    outputResults(results.map(r => ({
-      file: r.file,
-      displayPath: r.displayPath,
-      title: r.title,
-      body: r.body,
-      score: r.score,
-      context: r.context,
-      docid: r.docid,
-    })), query, { ...opts, limit: results.length });
-  }, { maxDuration: 10 * 60 * 1000, name: 'vectorSearch' });
+  outputResults(results.map(r => ({
+    file: r.file,
+    displayPath: r.displayPath,
+    title: r.title,
+    body: r.body,
+    score: r.score,
+    context: r.context,
+    docid: r.docid,
+  })), query, { ...opts, limit: results.length });
 }
 
 async function querySearch(query: string, opts: OutputOptions, _embedModel: string = DEFAULT_EMBED_MODEL, _rerankModel: string = DEFAULT_RERANK_MODEL): Promise<void> {
@@ -2231,125 +2229,123 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
   // Intent can come from --intent flag or from intent: line in query document
   const intent = opts.intent || parsed?.intent;
 
-  await withLLMSession(async () => {
-    let results;
+  let results;
 
-    if (parsed) {
-      const structuredQueries = parsed.searches;
-      // Structured search — user provided their own query expansions
-      const typeLabels = structuredQueries.map(s => s.type).join('+');
-      process.stderr.write(`${c.dim}Structured search: ${structuredQueries.length} queries (${typeLabels})${c.reset}\n`);
-      if (intent) {
-        process.stderr.write(`${c.dim}├─ intent: ${intent}${c.reset}\n`);
-      }
+  if (parsed) {
+    const structuredQueries = parsed.searches;
+    // Structured search — user provided their own query expansions
+    const typeLabels = structuredQueries.map(s => s.type).join('+');
+    process.stderr.write(`${c.dim}Structured search: ${structuredQueries.length} queries (${typeLabels})${c.reset}\n`);
+    if (intent) {
+      process.stderr.write(`${c.dim}├─ intent: ${intent}${c.reset}\n`);
+    }
 
-      // Log each sub-query
-      for (const s of structuredQueries) {
-        let preview = s.query.replace(/\n/g, ' ');
-        if (preview.length > 72) preview = preview.substring(0, 69) + '...';
-        process.stderr.write(`${c.dim}├─ ${s.type}: ${preview}${c.reset}\n`);
-      }
-      process.stderr.write(`${c.dim}└─ Searching...${c.reset}\n`);
+    // Log each sub-query
+    for (const s of structuredQueries) {
+      let preview = s.query.replace(/\n/g, ' ');
+      if (preview.length > 72) preview = preview.substring(0, 69) + '...';
+      process.stderr.write(`${c.dim}├─ ${s.type}: ${preview}${c.reset}\n`);
+    }
+    process.stderr.write(`${c.dim}└─ Searching...${c.reset}\n`);
 
-      results = await structuredSearch(store, structuredQueries, {
-        collections: singleCollection ? [singleCollection] : undefined,
-        limit: opts.all ? 500 : (opts.limit || 10),
-        minScore: opts.minScore || 0,
-        candidateLimit: opts.candidateLimit,
-        skipRerank: opts.skipRerank,
-        explain: !!opts.explain,
-        intent,
-        hooks: {
-          onEmbedStart: (count) => {
-            process.stderr.write(`${c.dim}Embedding ${count} ${count === 1 ? 'query' : 'queries'}...${c.reset}`);
-          },
-          onEmbedDone: (ms) => {
-            process.stderr.write(`${c.dim} (${formatMs(ms)})${c.reset}\n`);
-          },
-          onRerankStart: (chunkCount) => {
-            process.stderr.write(`${c.dim}Reranking ${chunkCount} chunks...${c.reset}`);
-            progress.indeterminate();
-          },
-          onRerankDone: (ms) => {
-            progress.clear();
-            process.stderr.write(`${c.dim} (${formatMs(ms)})${c.reset}\n`);
-          },
+    results = await structuredSearch(store, structuredQueries, {
+      collections: singleCollection ? [singleCollection] : undefined,
+      limit: opts.all ? 500 : (opts.limit || 10),
+      minScore: opts.minScore || 0,
+      candidateLimit: opts.candidateLimit,
+      skipRerank: opts.skipRerank,
+      explain: !!opts.explain,
+      intent,
+      hooks: {
+        onEmbedStart: (count) => {
+          process.stderr.write(`${c.dim}Embedding ${count} ${count === 1 ? 'query' : 'queries'}...${c.reset}`);
         },
-      });
-    } else {
-      // Standard hybrid query with automatic expansion
-      results = await hybridQuery(store, query, {
-        collection: singleCollection,
-        limit: opts.all ? 500 : (opts.limit || 10),
-        minScore: opts.minScore || 0,
-        candidateLimit: opts.candidateLimit,
-        skipRerank: opts.skipRerank,
-        explain: !!opts.explain,
-        intent,
-        hooks: {
-          onStrongSignal: (score) => {
-            process.stderr.write(`${c.dim}Strong BM25 signal (${score.toFixed(2)}) — skipping expansion${c.reset}\n`);
-          },
-          onExpandStart: () => {
-            process.stderr.write(`${c.dim}Expanding query...${c.reset}`);
-          },
-          onExpand: (original, expanded, ms) => {
-            process.stderr.write(`${c.dim} (${formatMs(ms)})${c.reset}\n`);
-            logExpansionTree(original, expanded);
-            process.stderr.write(`${c.dim}Searching ${expanded.length + 1} queries...${c.reset}\n`);
-          },
-          onEmbedStart: (count) => {
-            process.stderr.write(`${c.dim}Embedding ${count} ${count === 1 ? 'query' : 'queries'}...${c.reset}`);
-          },
-          onEmbedDone: (ms) => {
-            process.stderr.write(`${c.dim} (${formatMs(ms)})${c.reset}\n`);
-          },
-          onRerankStart: (chunkCount) => {
-            process.stderr.write(`${c.dim}Reranking ${chunkCount} chunks...${c.reset}`);
-            progress.indeterminate();
-          },
-          onRerankDone: (ms) => {
-            progress.clear();
-            process.stderr.write(`${c.dim} (${formatMs(ms)})${c.reset}\n`);
-          },
+        onEmbedDone: (ms) => {
+          process.stderr.write(`${c.dim} (${formatMs(ms)})${c.reset}\n`);
         },
-      });
-    }
+        onRerankStart: (chunkCount) => {
+          process.stderr.write(`${c.dim}Reranking ${chunkCount} chunks...${c.reset}`);
+          progress.indeterminate();
+        },
+        onRerankDone: (ms) => {
+          progress.clear();
+          process.stderr.write(`${c.dim} (${formatMs(ms)})${c.reset}\n`);
+        },
+      },
+    });
+  } else {
+    // Standard hybrid query with automatic expansion
+    results = await hybridQuery(store, query, {
+      collection: singleCollection,
+      limit: opts.all ? 500 : (opts.limit || 10),
+      minScore: opts.minScore || 0,
+      candidateLimit: opts.candidateLimit,
+      skipRerank: opts.skipRerank,
+      explain: !!opts.explain,
+      intent,
+      hooks: {
+        onStrongSignal: (score) => {
+          process.stderr.write(`${c.dim}Strong BM25 signal (${score.toFixed(2)}) — skipping expansion${c.reset}\n`);
+        },
+        onExpandStart: () => {
+          process.stderr.write(`${c.dim}Expanding query...${c.reset}`);
+        },
+        onExpand: (original, expanded, ms) => {
+          process.stderr.write(`${c.dim} (${formatMs(ms)})${c.reset}\n`);
+          logExpansionTree(original, expanded);
+          process.stderr.write(`${c.dim}Searching ${expanded.length + 1} queries...${c.reset}\n`);
+        },
+        onEmbedStart: (count) => {
+          process.stderr.write(`${c.dim}Embedding ${count} ${count === 1 ? 'query' : 'queries'}...${c.reset}`);
+        },
+        onEmbedDone: (ms) => {
+          process.stderr.write(`${c.dim} (${formatMs(ms)})${c.reset}\n`);
+        },
+        onRerankStart: (chunkCount) => {
+          process.stderr.write(`${c.dim}Reranking ${chunkCount} chunks...${c.reset}`);
+          progress.indeterminate();
+        },
+        onRerankDone: (ms) => {
+          progress.clear();
+          process.stderr.write(`${c.dim} (${formatMs(ms)})${c.reset}\n`);
+        },
+      },
+    });
+  }
 
-    // Post-filter for multi-collection
-    if (collectionNames.length > 1) {
-      results = results.filter(r => {
-        const prefixes = collectionNames.map(n => `qmd://${n}/`);
-        return prefixes.some(p => r.file.startsWith(p));
-      });
-    }
+  // Post-filter for multi-collection
+  if (collectionNames.length > 1) {
+    results = results.filter(r => {
+      const prefixes = collectionNames.map(n => `qmd://${n}/`);
+      return prefixes.some(p => r.file.startsWith(p));
+    });
+  }
 
-    closeDb();
+  closeDb();
 
-    if (results.length === 0) {
-      printEmptySearchResults(opts.format);
-      return;
-    }
+  if (results.length === 0) {
+    printEmptySearchResults(opts.format);
+    return;
+  }
 
-    // Use first lex/vec query for output context, or original query
-    const structuredQueries = parsed?.searches;
-    const displayQuery = structuredQueries
-      ? (structuredQueries.find(s => s.type === 'lex')?.query || structuredQueries.find(s => s.type === 'vec')?.query || query)
-      : query;
+  // Use first lex/vec query for output context, or original query
+  const structuredQueries = parsed?.searches;
+  const displayQuery = structuredQueries
+    ? (structuredQueries.find(s => s.type === 'lex')?.query || structuredQueries.find(s => s.type === 'vec')?.query || query)
+    : query;
 
-    // Map to CLI output format — use bestChunk for snippet display
-    outputResults(results.map(r => ({
-      file: r.file,
-      displayPath: r.displayPath,
-      title: r.title,
-      body: r.bestChunk,
-      chunkPos: r.bestChunkPos,
-      score: r.score,
-      context: r.context,
-      docid: r.docid,
-      explain: r.explain,
-    })), displayQuery, { ...opts, limit: results.length });
-  }, { maxDuration: 10 * 60 * 1000, name: 'querySearch' });
+  // Map to CLI output format — use bestChunk for snippet display
+  outputResults(results.map(r => ({
+    file: r.file,
+    displayPath: r.displayPath,
+    title: r.title,
+    body: r.bestChunk,
+    chunkPos: r.bestChunkPos,
+    score: r.score,
+    context: r.context,
+    docid: r.docid,
+    explain: r.explain,
+  })), displayQuery, { ...opts, limit: results.length });
 }
 
 // Parse CLI arguments using util.parseArgs
@@ -3209,7 +3205,7 @@ if (isMain) {
 
   if (cli.command !== "mcp") {
     await disposeDefaultLlamaCpp();
-    process.exit(0);
+    process.exitCode = 0;
   }
 
 } // end if (main module)
