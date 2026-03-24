@@ -1,11 +1,12 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import crypto from "node:crypto";
 import {
   ensurePipelineLayout,
   fileExists,
+  loadIndexedNote,
   logPipeline,
   nowIso,
+  parseIndexedNote as parseDurableIndexedNote,
   readJsonFile,
   releaseStaleLock,
   resolveDefaultConfigPath,
@@ -89,76 +90,21 @@ function trimInline(text, maxChars = 220) {
   return `${normalized.slice(0, maxChars - 1).trimEnd()}…`;
 }
 
-function parseFrontmatter(raw) {
-  const match = raw.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/);
-  if (!match) {
-    return { frontmatter: {}, body: raw };
-  }
-  const [, header, body] = match;
-  const frontmatter = {};
-  let arrayKey = null;
-  for (const rawLine of header.split(/\r?\n/)) {
-    const line = rawLine.replace(/\r/g, "");
-    const keyMatch = /^([A-Za-z0-9_-]+):\s*(.*)$/.exec(line.trim());
-    if (keyMatch) {
-      const [, key, value] = keyMatch;
-      if (value === "") {
-        frontmatter[key] = [];
-        arrayKey = key;
-      } else {
-        frontmatter[key] = value.trim();
-        arrayKey = null;
-      }
-      continue;
-    }
-    const itemMatch = /^\s*-\s*(.+)$/.exec(line);
-    if (itemMatch && arrayKey) {
-      frontmatter[arrayKey].push(itemMatch[1].trim());
-    }
-  }
-  return { frontmatter, body };
+function hasSensitiveMaterial(note) {
+  const combined = [
+    note?.title,
+    note?.summary,
+    note?.whyItMatters,
+    ...(Array.isArray(note?.evidence) ? note.evidence : []),
+  ]
+    .map((value) => String(value ?? ""))
+    .join("\n");
+  return /github_pat_[A-Za-z0-9_]+|\b(?:sk|rk|pk)-[A-Za-z0-9._-]{12,}\b|\bghp_[A-Za-z0-9]{20,}\b|\bBearer\s+[A-Za-z0-9._=-]{12,}\b/i.test(
+    combined,
+  );
 }
 
-function parseIndexedNote(raw, filePath, relativePath, stats) {
-  const { frontmatter, body } = parseFrontmatter(raw);
-  const summaryMatch = body.match(/^- Summary:\s*(.+)$/m);
-  const whyMatch = body.match(/^- Why it matters:\s*(.+)$/m);
-  const evidenceSection = body.match(/^- Evidence:\s*\n([\s\S]*?)(?:\n{2,}|$)/m);
-  const evidence = evidenceSection
-    ? evidenceSection[1]
-        .split(/\r?\n/)
-        .map((line) => /^\s*-\s*(.+)$/.exec(line)?.[1]?.trim() ?? "")
-        .filter(Boolean)
-    : [];
-
-  const titleMatch = body.match(/^#\s+(.+)$/m);
-  const createdAt =
-    typeof frontmatter.createdAt === "string" && frontmatter.createdAt.trim()
-      ? frontmatter.createdAt.trim()
-      : nowIso(stats.mtimeMs);
-
-  return {
-    filePath,
-    relativePath,
-    hash: crypto.createHash("sha1").update(raw).digest("hex"),
-    size: stats.size,
-    mtimeMs: stats.mtimeMs,
-    key: typeof frontmatter.key === "string" && frontmatter.key.trim() ? frontmatter.key.trim() : slugify(relativePath),
-    type: typeof frontmatter.type === "string" && frontmatter.type.trim() ? frontmatter.type.trim() : "fact",
-    project:
-      typeof frontmatter.project === "string" && frontmatter.project.trim()
-        ? frontmatter.project.trim()
-        : null,
-    title: titleMatch?.[1]?.trim() || slugify(relativePath),
-    summary: summaryMatch?.[1]?.trim() || "",
-    whyItMatters: whyMatch?.[1]?.trim() || "",
-    evidence,
-    tags: Array.isArray(frontmatter.tags) ? frontmatter.tags.map(String).filter(Boolean) : [],
-    createdAt,
-  };
-}
-
-async function scanIndexedNotes(indexedDir) {
+async function scanIndexedNotes(indexedDir, workspaceDir) {
   const notes = [];
   async function visit(dir) {
     let entries = [];
@@ -178,9 +124,13 @@ async function scanIndexedNotes(indexedDir) {
       }
       const raw = await fs.readFile(fullPath, "utf8");
       const stats = await fs.stat(fullPath);
-      notes.push(
-        parseIndexedNote(raw, fullPath, path.relative(indexedDir, fullPath).replace(/\\/g, "/"), stats),
-      );
+      const relativePath = path.relative(indexedDir, fullPath).replace(/\\/g, "/");
+      const parsed = parseDurableIndexedNote(raw, fullPath, relativePath, stats);
+      if (!parsed.sidecarPath || !workspaceDir) {
+        notes.push(parsed);
+        continue;
+      }
+      notes.push(await loadIndexedNote(fullPath, relativePath, { workspaceDir }));
     }
   }
   await visit(indexedDir);
@@ -321,7 +271,8 @@ function chunkNotes(notes, maxInputNotes) {
 }
 
 async function classifyPromotions(settings, pendingNotes, docs, store) {
-  const chunks = chunkNotes(pendingNotes, settings.promoter.maxInputNotes);
+  const eligibleNotes = pendingNotes.filter((note) => !hasSensitiveMaterial(note));
+  const chunks = chunkNotes(eligibleNotes, settings.promoter.maxInputNotes);
   const items = [];
   for (const chunk of chunks) {
     const raw = await callModel(settings, [
@@ -333,13 +284,15 @@ async function classifyPromotions(settings, pendingNotes, docs, store) {
           "Decide which indexed durable notes should be promoted into canonical files.",
           "Allowed targets: user, memory, soul, identity.",
           "Allowed statuses: active, proposal, conflict.",
-          "Rules:",
-          "- user: only long-lived user preferences, work style, environment constraints, long-term interests, or communication preferences.",
-          "- memory: only global stable facts, cross-session project background, stable paths/URLs/IDs/providers/config, long-lived workflows, or durable decisions.",
-          "- soul / identity are proposal-only. Use them only if the user explicitly asked to change assistant style, boundaries, tone, name, role, or self-introduction.",
-          "- If a note is too transient or not canonical, omit it.",
-          "- Reuse canonicalKey for semantically equivalent items.",
-          "- Prefer proposal or conflict over silently changing uncertain canonical facts.",
+           "Rules:",
+           "- user: only long-lived user preferences, work style, environment constraints, long-term interests, or communication preferences.",
+           "- memory: only global stable facts, cross-session project background, stable paths/URLs/IDs/providers/config, long-lived workflows, or durable decisions.",
+           "- soul / identity are proposal-only. Use them only if the user explicitly asked to change assistant style, boundaries, tone, name, role, or self-introduction.",
+           "- Never promote secrets, credentials, tokens, passwords, cookies, API keys, bearer tokens, or auth material, even if redacted.",
+           "- If a note mainly says something was repaired, fixed, or works again, omit it unless it also captures a stable workflow or configuration fact.",
+           "- If a note is too transient or not canonical, omit it.",
+           "- Reuse canonicalKey for semantically equivalent items.",
+           "- Prefer proposal or conflict over silently changing uncertain canonical facts.",
           "JSON shape:",
           '{"items":[{"sourceKey":"note-key","target":"user","status":"active","canonicalKey":"stable-kebab-key","title":"Short title","summary":"One sentence","evidence":["..."],"confidence":0.84,"reason":"short explanation"}]}',
         ].join(" "),
@@ -563,7 +516,7 @@ async function writeProposal(paths, item, settings) {
 }
 
 export async function assessPendingPromotion({ settings, paths }) {
-  const notes = await scanIndexedNotes(paths.indexedDir);
+  const notes = await scanIndexedNotes(paths.indexedDir, paths.workspaceDir);
   const cursor = await loadCanonicalCursor(paths);
   const { pending, stats } = collectPendingNotes(notes, cursor);
   const decision = shouldPromote(settings, stats);

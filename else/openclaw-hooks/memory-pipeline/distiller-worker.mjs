@@ -1,18 +1,24 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import crypto from "node:crypto";
 import { maybePromoteCanonical } from "./canonical-promoter.mjs";
 import {
   cleanupVisibleText,
+  createSidecarRelativePath,
+  dedupeStrings,
   ensurePipelineLayout,
   extractTextContent,
   fileExists,
+  loadIndexedNote,
   logPipeline,
+  mergeDurableNote,
+  normalizeExtractedNote,
   nowIso,
   parseSessionKey,
   pickDefined,
   readJsonFile,
   readJsonl,
+  renderIndexedNote,
+  renderSidecarNote,
   releaseStaleLock,
   resolveDefaultConfigPath,
   resolveHookSettings,
@@ -23,6 +29,7 @@ import {
   shortDatePrefix,
   slugify,
   writeJsonFile,
+  writeTextFileIfChanged,
 } from "./common.mjs";
 
 function parseArgs(argv) {
@@ -63,6 +70,90 @@ function extractJson(text) {
     throw new Error("no json object found");
   }
   return JSON.parse(candidate.slice(firstBrace, lastBrace + 1));
+}
+
+function toErrorMessage(error) {
+  return error instanceof Error ? error.message : String(error);
+}
+
+const SENSITIVE_VALUE_PATTERN =
+  /github_pat_[A-Za-z0-9_]+|\b(?:sk|rk|pk)-[A-Za-z0-9._-]{12,}\b|\bghp_[A-Za-z0-9]{20,}\b|\bBearer\s+[A-Za-z0-9._=-]{12,}\b/gi;
+
+export function redactSensitiveValues(text) {
+  return String(text ?? "").replace(SENSITIVE_VALUE_PATTERN, "[REDACTED_SECRET]");
+}
+
+export function sanitizeExtractedNotePayload(note) {
+  if (!note || typeof note !== "object") {
+    return note;
+  }
+  const sanitizeList = (value) =>
+    Array.isArray(value)
+      ? value
+          .map((item) => redactSensitiveValues(item))
+          .map((item) => item.trim())
+          .filter(Boolean)
+      : value;
+
+  return {
+    ...note,
+    title: redactSensitiveValues(note.title),
+    summary: redactSensitiveValues(note.summary),
+    whyItMatters: redactSensitiveValues(note.whyItMatters),
+    project: typeof note.project === "string" ? redactSensitiveValues(note.project) : note.project,
+    evidence: sanitizeList(note.evidence),
+    durableDetails: sanitizeList(note.durableDetails),
+    configRefs: sanitizeList(note.configRefs),
+    keyExcerpts: sanitizeList(note.keyExcerpts),
+    sourceAnchors: Array.isArray(note.sourceAnchors)
+      ? note.sourceAnchors.map((anchor) => ({
+          ...anchor,
+          excerpt: redactSensitiveValues(anchor?.excerpt),
+        }))
+      : note.sourceAnchors,
+  };
+}
+
+async function repairMalformedJson(settings, raw, error) {
+  const system = [
+    "You repair malformed JSON produced by another model.",
+    "Return JSON only.",
+    'Return an object with shape {"notes":[...]} exactly.',
+    "Preserve valid content when possible, but drop any field or note you cannot repair safely.",
+    'If nothing can be repaired, return {"notes":[]}.',
+  ].join(" ");
+  const user = [
+    "Repair this malformed JSON into valid JSON.",
+    `Parse error: ${toErrorMessage(error)}`,
+    "",
+    "Malformed JSON:",
+    "```json",
+    String(raw ?? "").trim(),
+    "```",
+  ].join("\n");
+  return callModel(
+    settings,
+    [
+      { role: "system", content: system },
+      { role: "user", content: user },
+    ],
+    { temperature: 0 },
+  );
+}
+
+async function extractJsonWithRepair(settings, raw) {
+  try {
+    return extractJson(raw);
+  } catch (error) {
+    const repairedRaw = await repairMalformedJson(settings, raw, error);
+    try {
+      return extractJson(repairedRaw);
+    } catch (repairError) {
+      throw new Error(
+        `distiller JSON parse failed after repair: ${toErrorMessage(error)} | repair: ${toErrorMessage(repairError)}`,
+      );
+    }
+  }
 }
 
 async function readConfig(configFile) {
@@ -214,13 +305,14 @@ function isVisibleTurnEntry(entry) {
   return entry?.type === "message" && entry?.message && typeof entry.message === "object";
 }
 
-async function readTranscriptTurns(sessionFile) {
+export async function readTranscriptTurns(sessionFile) {
   const raw = await fs.readFile(sessionFile, "utf8");
   const lines = raw.split(/\r?\n/).filter(Boolean);
   const turns = [];
   let transcriptSessionId = null;
 
-  for (const line of lines) {
+  for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
+    const line = lines[lineIndex];
     let entry;
     try {
       entry = JSON.parse(line);
@@ -260,6 +352,8 @@ async function readTranscriptTurns(sessionFile) {
       role,
       text: visibleText,
       timestamp: entry.timestamp ?? entry.message.timestamp ?? null,
+      turnNumber: turns.length + 1,
+      jsonlLine: lineIndex + 1,
     });
   }
 
@@ -277,17 +371,19 @@ function getDeltaTurns(turns, cursorEntry) {
   return turns.slice(lastIndex + 1);
 }
 
-function formatTurns(turns) {
+export function formatTurns(turns) {
   return turns
     .map((turn, index) => {
-      const label = String(index + 1).padStart(4, "0");
+      const label = `T${String(turn.turnNumber ?? index + 1).padStart(4, "0")}`;
+      const line = turn.jsonlLine ? ` L${turn.jsonlLine}` : "";
+      const id = turn.id ? ` id=${turn.id}` : "";
       const time = turn.timestamp ? ` ${turn.timestamp}` : "";
-      return `${label}${time} ${turn.role}: ${turn.text}`;
+      return `${label}${line}${id}${time} ${turn.role}: ${turn.text}`;
     })
     .join("\n\n");
 }
 
-function chunkTurns(turns, maxChars) {
+export function chunkTurns(turns, maxChars) {
   const chunks = [];
   let current = [];
   let currentChars = 0;
@@ -307,7 +403,41 @@ function chunkTurns(turns, maxChars) {
   return chunks;
 }
 
-async function callModel(settings, messages) {
+function formatTurnRange(turns) {
+  if (!Array.isArray(turns) || turns.length === 0) {
+    return "turns 0-0";
+  }
+  const first = turns[0];
+  const last = turns[turns.length - 1];
+  return `turns ${first.turnNumber ?? 1}-${last.turnNumber ?? first.turnNumber ?? 1}`;
+}
+
+export function aggregateCandidateNotes(notes, context = {}) {
+  const aggregated = new Map();
+  for (const note of notes) {
+    if (!note?.key) {
+      continue;
+    }
+    const existing = aggregated.get(note.key);
+    aggregated.set(
+      note.key,
+      existing
+        ? mergeDurableNote(existing, {
+            ...note,
+            updatedAt: context.updatedAt ?? note.updatedAt ?? nowIso(),
+            lastSeenAt: context.updatedAt ?? note.lastSeenAt ?? nowIso(),
+          })
+        : {
+            ...note,
+            updatedAt: context.updatedAt ?? note.updatedAt ?? nowIso(),
+            lastSeenAt: context.updatedAt ?? note.lastSeenAt ?? nowIso(),
+          },
+    );
+  }
+  return [...aggregated.values()];
+}
+
+async function callModel(settings, messages, overrides = {}) {
   const apiKey = process.env[settings.distiller.apiKeyEnv];
   if (!apiKey) {
     throw new Error(`Missing distiller API key env: ${settings.distiller.apiKeyEnv}`);
@@ -321,8 +451,14 @@ async function callModel(settings, messages) {
     },
     body: JSON.stringify({
       model: settings.distiller.model,
-      temperature: settings.distiller.temperature,
-      max_tokens: settings.distiller.maxOutputTokens,
+      temperature:
+        typeof overrides.temperature === "number"
+          ? overrides.temperature
+          : settings.distiller.temperature,
+      max_tokens:
+        typeof overrides.maxOutputTokens === "number" && overrides.maxOutputTokens > 0
+          ? Math.floor(overrides.maxOutputTokens)
+          : settings.distiller.maxOutputTokens,
       messages,
     }),
     signal: AbortSignal.timeout(settings.distiller.timeoutMs),
@@ -347,7 +483,7 @@ async function callModel(settings, messages) {
   throw new Error("distiller model returned no content");
 }
 
-async function extractNotes(settings, turns) {
+export async function extractNotes(settings, turns) {
   const transcript = formatTurns(turns);
   const system = [
     "You are a durable-memory distiller for OpenClaw.",
@@ -355,7 +491,10 @@ async function extractNotes(settings, turns) {
     "Extract only long-lived notes worth indexing for future recall.",
     "Allowed note types: preference, decision, procedure, project, fact.",
     "Reject small talk, tentative brainstorming, unresolved guesses, and purely short-term context.",
-    "Each note must include: type, key, title, summary, whyItMatters, evidence (1-3 strings), project (string or null), tags (0-5 strings).",
+    "Each note must include: type, key, title, summary, whyItMatters, evidence (1-6 strings), project (string or null), tags (0-5 strings).",
+    "Also include durableDetails (0-8 strings), configRefs (0-6 strings), sourceAnchors (1-4 objects), keyExcerpts (0-4 strings).",
+    "Use exact source anchor coordinates from the transcript labels when available.",
+    "Each source anchor object must use: turnStart, turnEnd, messageIds, jsonlLineStart, jsonlLineEnd, excerpt.",
     "Make key stable, lowercase, and kebab-case.",
   ].join(" ");
   const user = [
@@ -363,14 +502,14 @@ async function extractNotes(settings, turns) {
     transcript,
     "",
     "Return a JSON object with this shape:",
-    '{"notes":[{"type":"decision","key":"stable-kebab-key","title":"Short title","summary":"One or two sentences","whyItMatters":"One sentence","evidence":["..."],"project":null,"tags":["tag"]}]}',
+    '{"notes":[{"type":"decision","key":"stable-kebab-key","title":"Short title","summary":"One or two sentences","whyItMatters":"One sentence","evidence":["..."],"project":null,"tags":["tag"],"durableDetails":["..."],"configRefs":["..."],"sourceAnchors":[{"turnStart":11,"turnEnd":18,"messageIds":["abc"],"jsonlLineStart":84,"jsonlLineEnd":97,"excerpt":"..."}],"keyExcerpts":["..."]}]}',
     'If nothing is durable, return {"notes":[]}.',
   ].join("\n");
   const raw = await callModel(settings, [
     { role: "system", content: system },
     { role: "user", content: user },
   ]);
-  const parsed = extractJson(raw);
+  const parsed = await extractJsonWithRepair(settings, raw);
   return Array.isArray(parsed.notes) ? parsed.notes : [];
 }
 
@@ -453,7 +592,7 @@ async function scanExistingIndexedKeys(indexedDir) {
       }
       try {
         const raw = await fs.readFile(fullPath, "utf8");
-        const match = raw.match(/^---\n([\s\S]*?)\n---/);
+        const match = raw.match(/^---\r?\n([\s\S]*?)\r?\n---/);
         if (!match) {
           continue;
         }
@@ -492,77 +631,72 @@ function noteDirectoryFor(paths, note) {
   }
 }
 
-function normalizeNote(raw) {
-  const type = ["preference", "decision", "procedure", "project", "fact"].includes(raw?.type)
-    ? raw.type
-    : "fact";
-  const title = typeof raw?.title === "string" ? raw.title.trim() : "";
-  const summary = typeof raw?.summary === "string" ? raw.summary.trim() : "";
-  const whyItMatters =
-    typeof raw?.whyItMatters === "string" ? raw.whyItMatters.trim() : "";
-  const keySource = typeof raw?.key === "string" ? raw.key : title || summary;
-  const key = slugify(
-    keySource,
-    crypto.createHash("sha1").update(JSON.stringify(raw ?? {})).digest("hex").slice(0, 10),
-  );
-  if (!title || !summary || !whyItMatters) {
-    return null;
-  }
-  return {
-    type,
-    key,
-    title,
-    summary,
-    whyItMatters,
-    evidence: Array.isArray(raw?.evidence) ? raw.evidence.map(String).filter(Boolean).slice(0, 3) : [],
-    project:
-      typeof raw?.project === "string" && raw.project.trim() ? slugify(raw.project) : null,
-    tags: Array.isArray(raw?.tags) ? raw.tags.map((tag) => slugify(tag)).filter(Boolean).slice(0, 5) : [],
-  };
-}
-
 async function writeIndexedNotes(paths, notes, context) {
   const written = [];
   const existing = await scanExistingIndexedKeys(paths.indexedDir);
+  const updatedAt = context.updatedAt ?? nowIso();
   for (const note of notes) {
-    const normalized = normalizeNote(note);
-    if (!normalized) {
+    if (!note?.key) {
       continue;
     }
-    if (existing[normalized.key]) {
-      continue;
-    }
-    const dir = noteDirectoryFor(paths, normalized);
+    const existingPath = existing[note.key] ?? null;
+    const existingRelativePath = existingPath
+      ? path.relative(paths.indexedDir, existingPath).replace(/\\/g, "/")
+      : null;
+    const existingNote = existingPath
+      ? await loadIndexedNote(existingPath, existingRelativePath, { workspaceDir: paths.workspaceDir })
+      : null;
+    const incomingSourceSessions = dedupeStrings(
+      [...(note.sourceSessions ?? []), ...(context.sessionId ? [context.sessionId] : [])],
+      { maxCount: 32, maxChars: 120 },
+    );
+    const incomingNote = {
+      ...note,
+      sessionId: context.sessionId ?? note.sessionId ?? null,
+      sourcePath: context.sourcePath ?? note.sourcePath ?? null,
+      sourceRange: context.sourceRange ?? note.sourceRange ?? null,
+      sourceSessions: incomingSourceSessions,
+      updatedAt,
+      lastSeenAt: updatedAt,
+      sidecarPath: note.sidecarPath ?? existingNote?.sidecarPath ?? null,
+    };
+    const merged = existingNote
+      ? mergeDurableNote(existingNote, incomingNote)
+      : {
+          ...incomingNote,
+          createdAt: note.createdAt ?? updatedAt,
+        };
+    const dir = existingPath ? path.dirname(existingPath) : noteDirectoryFor(paths, merged);
     await fs.mkdir(dir, { recursive: true });
-    const createdAt = nowIso();
-    const fileName = `${shortDatePrefix(createdAt)}-${slugify(normalized.key).slice(0, 60)}.md`;
-    const filePath = path.join(dir, fileName);
-    const frontmatter = [
-      "---",
-      `key: ${normalized.key}`,
-      `type: ${normalized.type}`,
-      `project: ${normalized.project ?? ""}`,
-      `sessionId: ${context.sessionId ?? ""}`,
-      `createdAt: ${createdAt}`,
-      `sourcePath: ${context.sourcePath}`,
-      `sourceRange: ${context.sourceRange}`,
-      "tags:",
-      ...(normalized.tags.length > 0 ? normalized.tags.map((tag) => `  - ${tag}`) : ["  - memory"]),
-      "---",
-      "",
-      `# ${normalized.title}`,
-      "",
-      `- Summary: ${normalized.summary}`,
-      `- Why it matters: ${normalized.whyItMatters}`,
-      "- Evidence:",
-      ...(normalized.evidence.length > 0
-        ? normalized.evidence.map((item) => `  - ${item}`)
-        : ["  - Derived from the latest session boundary transcript."]),
-      "",
-    ].join("\n");
-    await fs.writeFile(filePath, frontmatter, "utf8");
-    existing[normalized.key] = filePath;
-    written.push(filePath);
+    const filePath = existingPath || path.join(
+      dir,
+      `${shortDatePrefix(merged.createdAt ?? updatedAt)}-${slugify(merged.key).slice(0, 60)}.md`,
+    );
+    const rendered = renderIndexedNote({
+      ...merged,
+      sidecarPath: merged.sidecarPath || createSidecarRelativePath(merged.sessionId, merged.key),
+    });
+    const oldSidecarPath = existingNote?.sidecarPath ?? null;
+    const nextSidecarPath = rendered.overflow ? rendered.sidecarPath : null;
+    const indexedChanged = await writeTextFileIfChanged(filePath, rendered.content);
+    if (rendered.overflow && nextSidecarPath) {
+      const sidecarFullPath = path.join(paths.workspaceDir, nextSidecarPath.replace(/\//g, path.sep));
+      await writeTextFileIfChanged(sidecarFullPath, renderSidecarNote({
+        ...merged,
+        sidecarPath: nextSidecarPath,
+      }));
+    } else if (oldSidecarPath) {
+      const oldSidecarFullPath = path.join(paths.workspaceDir, oldSidecarPath.replace(/\//g, path.sep));
+      await fs.rm(oldSidecarFullPath, { force: true });
+    }
+    if (oldSidecarPath && nextSidecarPath && oldSidecarPath !== nextSidecarPath) {
+      const oldSidecarFullPath = path.join(paths.workspaceDir, oldSidecarPath.replace(/\//g, path.sep));
+      await fs.rm(oldSidecarFullPath, { force: true });
+    }
+    existing[merged.key] = filePath;
+    if (indexedChanged) {
+      written.push(filePath);
+    }
   }
   return written;
 }
@@ -599,7 +733,7 @@ async function writeSessionState(paths, state) {
   await fs.writeFile(paths.sessionStateFile, `${body}\n`, "utf8");
 }
 
-async function runQmdUpdate(cfg, settings) {
+export async function runQmdCommand(cfg, settings, subcommand) {
   if (!settings.qmdUpdateEnabled) {
     return;
   }
@@ -613,7 +747,7 @@ async function runQmdUpdate(cfg, settings) {
     const isScript = /\.(?:mjs|js|cjs)$/i.test(command);
     const child = spawn(
       isScript ? process.execPath : command,
-      isScript ? [command, "update"] : ["update"],
+      isScript ? [command, subcommand] : [subcommand],
       {
         env: process.env,
         windowsHide: true,
@@ -626,9 +760,17 @@ async function runQmdUpdate(cfg, settings) {
         resolve();
         return;
       }
-      reject(new Error(`QMD update exited with code ${code}`));
+      reject(new Error(`QMD ${subcommand} exited with code ${code}`));
     });
   });
+}
+
+export async function runQmdUpdate(cfg, settings) {
+  await runQmdCommand(cfg, settings, "update");
+}
+
+export async function runQmdEmbed(cfg, settings) {
+  await runQmdCommand(cfg, settings, "embed");
 }
 
 async function processJob(job, settings, paths, openclawHome, cursor) {
@@ -655,10 +797,26 @@ async function processJob(job, settings, paths, openclawHome, cursor) {
 
   const chunks = chunkTurns(deltaTurns, settings.distiller.chunkChars);
   const noteCandidates = [];
+  const noteTimestamp = nowIso();
   for (const chunk of chunks) {
     const notes = await extractNotes(settings, chunk);
-    noteCandidates.push(...notes);
+    const chunkRange = formatTurnRange(chunk);
+    for (const rawNote of notes) {
+      const sanitizedRawNote = sanitizeExtractedNotePayload(rawNote);
+      const normalized = normalizeExtractedNote(sanitizedRawNote, {
+        sessionId,
+        sourcePath: path.basename(sessionFile),
+        sourceRange: chunkRange,
+        chunkTurns: chunk,
+        createdAt: noteTimestamp,
+        updatedAt: noteTimestamp,
+      });
+      if (normalized) {
+        noteCandidates.push(normalized);
+      }
+    }
   }
+  const aggregatedNotes = aggregateCandidateNotes(noteCandidates, { updatedAt: noteTimestamp });
 
   const stateTurns = deltaTurns.slice(-settings.distiller.tailTurnsForState);
   const stateRef = `${job.sourceEvent} · ${path.basename(sessionFile)} · turns ${Math.max(
@@ -668,10 +826,11 @@ async function processJob(job, settings, paths, openclawHome, cursor) {
   const state = await summarizeState(settings, stateTurns, stateRef);
   await writeSessionState(paths, state);
 
-  const written = await writeIndexedNotes(paths, noteCandidates, {
+  const written = await writeIndexedNotes(paths, aggregatedNotes, {
     sessionId,
     sourcePath: path.basename(sessionFile),
     sourceRange: `turns ${Math.max(transcript.turns.length - deltaTurns.length + 1, 1)}-${transcript.turns.length}`,
+    updatedAt: noteTimestamp,
   });
 
   cursor.sessions[sessionId] = {
@@ -772,13 +931,25 @@ async function main() {
     );
 
     if (qmdRelevantWrites) {
+      let updateSucceeded = false;
       try {
         await runQmdUpdate(cfg, settings);
+        updateSucceeded = true;
         await logPipeline(paths, "info", "qmd update completed", {});
       } catch (error) {
         await logPipeline(paths, "warn", "qmd update failed", {
           error: error instanceof Error ? error.message : String(error),
         });
+      }
+      if (updateSucceeded) {
+        try {
+          await runQmdEmbed(cfg, settings);
+          await logPipeline(paths, "info", "qmd embed completed", {});
+        } catch (error) {
+          await logPipeline(paths, "warn", "qmd embed failed", {
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
       }
     }
 
@@ -795,15 +966,17 @@ async function main() {
   }
 }
 
-main().catch(async (error) => {
-  const args = parseArgs(process.argv.slice(2));
-  const cfg = await readConfig(args.configFile);
-  const workspaceDir = resolveWorkspaceDir({ cfg, override: args.workspace });
-  const paths = resolvePipelinePaths(workspaceDir);
-  await ensurePipelineLayout(paths);
-  await logPipeline(paths, "error", "distiller worker crashed", {
-    error: error instanceof Error ? error.message : String(error),
+if (import.meta.url === `file://${process.argv[1]?.replace(/\\/g, "/")}` || process.argv[1]?.endsWith("distiller-worker.mjs")) {
+  main().catch(async (error) => {
+    const args = parseArgs(process.argv.slice(2));
+    const cfg = await readConfig(args.configFile);
+    const workspaceDir = resolveWorkspaceDir({ cfg, override: args.workspace });
+    const paths = resolvePipelinePaths(workspaceDir);
+    await ensurePipelineLayout(paths);
+    await logPipeline(paths, "error", "distiller worker crashed", {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    await releaseLock(paths);
+    process.exitCode = 1;
   });
-  await releaseLock(paths);
-  process.exitCode = 1;
-});
+}
